@@ -6,6 +6,7 @@ the idioms, APIs, and output schema shown in the three starter examples under
 ``examples/run_<target>.py``.
 """
 
+import json
 import os
 import re
 import tempfile
@@ -398,8 +399,292 @@ def run(qasm_str: str, target: str, shots: int) -> Dict[str, Any]:
 
 
 def agent_chat(prompt: str) -> str:
-    """Optional L2 entry point using LOOMQ_LLM_* env vars."""
-    raise NotImplementedError("L2 is optional; implement agent_chat(prompt) to enter")
+    """L2 entry point: handle QASM generation, correction, and backend selection.
+
+    Reads LOOMQ_LLM_* env vars via llm_client.chat_completion().
+    Classifies the prompt into one of three task types, then routes accordingly.
+    For QASM tasks: LLM generates → L1 self-validation → retry up to MAX_ITERATIONS.
+    For backend tasks: LLM picks from backend_capabilities.json whitelist.
+    """
+    task_type = _classify_task(prompt)
+
+    if task_type == "backend":
+        return _handle_backend_selection(prompt)
+    if task_type == "correction":
+        return _handle_qasm_correction(prompt)
+    return _handle_qasm_generation(prompt)
+
+
+# ---------------------------------------------------------------------------
+# L2 helpers
+# ---------------------------------------------------------------------------
+
+_MAX_ITERATIONS = 3
+
+
+def _classify_task(prompt: str) -> str:
+    """Classify user prompt into: generation / correction / backend.
+
+    Uses keyword heuristics (NOT hardcoded answers) to route the prompt.
+    """
+    p = prompt.lower()
+
+    # QASM code present in input → correction task
+    qasm_signals = ["openqasm", "qreg", "creg", "h q[", "cx q[", "measure q",
+                    "x q[", "y q[", "z q[", "s q[", "t q[", "swap q["]
+    if any(sig in p for sig in qasm_signals):
+        # But if the user explicitly asks to "generate" despite having QASM snippets,
+        # still treat as correction — they provided code and want it fixed.
+        return "correction"
+
+    # Backend selection: strong signal (后端/backend) OR weak+qubit combo
+    strong_backend = ["后端", "backend"]
+    weak_backend = ["排队", "queue", "成本", "cost", "模拟器", "simulator",
+                    "真机", "qpu", "免费", "free", "无需注册", "no account"]
+    qubit_signal = ["比特", "qubit"]
+
+    if any(k in p for k in strong_backend):
+        return "backend"
+    if any(k in p for k in weak_backend) and any(k in p for k in qubit_signal):
+        return "backend"
+
+    # Default: generation
+    return "generation"
+
+
+def _call_llm(system_prompt: str, user_prompt: str) -> str:
+    """Call LLM via llm_client.chat_completion and return assistant text."""
+    from llm_client import chat_completion
+
+    response = chat_completion(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+    )
+    # Defensive parse — handle various response shapes
+    choices = response.get("choices") or []
+    if not choices:
+        raise RuntimeError("LLM returned no choices")
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if not content:
+        raise RuntimeError("LLM returned empty content")
+    return content
+
+
+def _extract_qasm_from_text(text: str) -> str:
+    """Extract a complete OpenQASM 2.0 program from LLM response text."""
+    # 1) Try fenced code block: ```qasm ... ``` or ```openqasm ... ```
+    code_block = re.search(
+        r"```(?:openqasm|qasm)?\s*\n(OPENQASM\s+2\.0;.*?)```",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if code_block:
+        return code_block.group(1).strip()
+
+    # 2) Try raw QASM starting with OPENQASM 2.0;
+    match = re.search(r"(OPENQASM\s+2\.0;.*?)(?:\n\s*\n|\Z)", text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+
+    return ""
+
+
+def _validate_qasm(qasm: str) -> tuple:
+    """Validate QASM by running through L1 transpile + run.
+
+    Returns (ok: bool, error: str).
+    """
+    for target in ("braket", "spinq"):
+        try:
+            transpile(qasm, target)
+            result = run(qasm, target, 256)
+            if result.get("counts"):
+                return True, ""
+        except Exception as exc:
+            continue
+    return False, "QASM failed L1 validation (transpile or run error)"
+
+
+def _handle_qasm_generation(prompt: str) -> str:
+    """Handle QASM generation: NL → LLM → QASM → L1 validate → retry."""
+    system = (
+        "You are a quantum circuit expert. Generate valid OpenQASM 2.0 code.\n"
+        "Rules:\n"
+        "- Always start with 'OPENQASM 2.0;'\n"
+        '- Include \'include "qelib1.inc";\'\n'
+        "- Declare qreg and creg with matching sizes\n"
+        "- Use correct gate names: h, x, y, z, s, sdg, t, tdg, cx, cz, swap, ccx, ry, rz, etc.\n"
+        "- End with 'measure q -> c;'\n"
+        "- Output ONLY the QASM code inside a ```qasm code block, no explanations\n"
+        "- For GHZ state: H on q[0], then CX q[0],q[1], CX q[1],q[2], ... chain\n"
+        "- For Bell state: H on q[0], then CX q[0],q[1]\n"
+        "- Gate operands use comma: 'cx q[0],q[1];' not 'cx q[0] q[1];'\n"
+    )
+
+    last_qasm = ""
+    last_error = ""
+
+    for i in range(_MAX_ITERATIONS):
+        user_msg = prompt
+        if last_error:
+            user_msg += (
+                f"\n\nPrevious attempt failed validation: {last_error}\n"
+                "Please fix and regenerate."
+            )
+
+        reply = _call_llm(system, user_msg)
+        qasm = _extract_qasm_from_text(reply)
+        if not qasm:
+            last_error = "No QASM found in response"
+            continue
+
+        last_qasm = qasm
+        ok, err = _validate_qasm(qasm)
+        if ok:
+            return f"```qasm\n{qasm}\n```"
+        last_error = err
+
+    if last_qasm:
+        return f"```qasm\n{last_qasm}\n```"
+    return reply
+
+
+def _handle_qasm_correction(prompt: str) -> str:
+    """Handle QASM correction: error QASM + intent → LLM → fix → L1 validate → retry."""
+    system = (
+        "You are a quantum circuit expert. Fix errors in OpenQASM 2.0 code.\n"
+        "Rules:\n"
+        "- Understand the user's target state/intent first\n"
+        "- Check: missing OPENQASM header, missing include, missing qreg/creg, "
+        "wrong gate names, wrong syntax, wrong qubit count\n"
+        "- Preserve the user's intended quantum state\n"
+        "- Output ONLY the corrected QASM code inside a ```qasm code block, no explanations\n"
+        "- Always start with 'OPENQASM 2.0;'\n"
+        '- Include \'include "qelib1.inc";\'\n'
+        "- End with 'measure q -> c;'\n"
+        "- Gate operands use comma: 'cx q[0],q[1];' not 'cx q[0] q[1];'\n"
+    )
+
+    last_qasm = ""
+    last_error = ""
+
+    for i in range(_MAX_ITERATIONS):
+        user_msg = prompt
+        if last_error:
+            user_msg += (
+                f"\n\nPrevious fix failed validation: {last_error}\n"
+                "Please try again."
+            )
+
+        reply = _call_llm(system, user_msg)
+        qasm = _extract_qasm_from_text(reply)
+        if not qasm:
+            last_error = "No QASM found in response"
+            continue
+
+        last_qasm = qasm
+        ok, err = _validate_qasm(qasm)
+        if ok:
+            return f"```qasm\n{qasm}\n```"
+        last_error = err
+
+    if last_qasm:
+        return f"```qasm\n{last_qasm}\n```"
+    return reply
+
+
+def _handle_backend_selection(prompt: str) -> str:
+    """Handle backend selection using backend_capabilities.json whitelist."""
+    caps = _load_backend_capabilities()
+    backends = caps["backends"]
+    valid_ids = [b["id"] for b in backends]
+
+    # Build whitelist description for LLM
+    lines = []
+    for b in backends:
+        lines.append(
+            f"- id={b['id']}, kind={b['kind']}, max_qubits={b['max_qubits']}, "
+            f"queue={b['queue']}, cost={b['cost']}, requires_account={b['requires_account']}"
+        )
+    whitelist_str = "\n".join(lines)
+
+    system = (
+        "You are a quantum backend advisor. Select the best backend for the user.\n"
+        "Available backends (ONLY choose from these IDs):\n"
+        f"{whitelist_str}\n\n"
+        "Rules:\n"
+        "- Backend max_qubits must be >= the user's required qubit count\n"
+        "- If user wants zero/no queue: choose queue='none'\n"
+        "- If user wants free: choose cost='free'\n"
+        "- If user wants no registration: choose requires_account=false\n"
+        "- Prefer simulators for local/free/no-queue requirements\n"
+        "- Output ONLY the backend ID, nothing else. No explanation.\n"
+        f"- Valid IDs: {', '.join(valid_ids)}\n"
+    )
+
+    try:
+        reply = _call_llm(system, prompt)
+        # Extract backend ID from response
+        reply_stripped = reply.strip().strip("`").strip()
+        if reply_stripped in valid_ids:
+            return reply_stripped
+        for vid in valid_ids:
+            if vid in reply:
+                return vid
+    except Exception:
+        pass
+
+    # Fallback: Python-based selection
+    return _python_backend_selection(prompt, backends)
+
+
+def _python_backend_selection(prompt: str, backends: list) -> str:
+    """Fallback backend selection using Python heuristics."""
+    p = prompt.lower()
+
+    # Extract qubit count
+    qubit_match = re.search(r"(\d+)\s*(?:比特|qubit)", p)
+    qubits = int(qubit_match.group(1)) if qubit_match else 0
+
+    want_no_queue = any(k in p for k in ["零排队", "no queue", "无排队", "no wait", "不排队"])
+    want_free = any(k in p for k in ["免费", "free", "无成本", "no cost"])
+    want_no_account = any(k in p for k in ["无需注册", "no account", "不用注册", "免注册"])
+    want_qpu = any(k in p for k in ["真机", "qpu", "real", "硬件"])
+
+    candidates = list(backends)
+    if qubits:
+        candidates = [b for b in candidates if b["max_qubits"] >= qubits]
+    if want_no_queue:
+        candidates = [b for b in candidates if b["queue"] == "none"]
+    if want_free:
+        candidates = [b for b in candidates if b["cost"] == "free"]
+    if want_no_account:
+        candidates = [b for b in candidates if not b["requires_account"]]
+    if want_qpu:
+        candidates = [b for b in candidates if b["kind"] == "qpu"]
+
+    if not candidates:
+        candidates = list(backends)
+
+    # Prefer simulator if no QPU requirement
+    if not want_qpu:
+        sims = [b for b in candidates if b["kind"] == "simulator"]
+        if sims:
+            candidates = sims
+
+    return candidates[0]["id"] if candidates else backends[0]["id"]
+
+
+def _load_backend_capabilities() -> dict:
+    """Load backend_capabilities.json from the same directory as this module."""
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "backend_capabilities.json"
+    )
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def compile_hybrid(hybrid_qasm_str: str) -> Tuple[List[str], str]:

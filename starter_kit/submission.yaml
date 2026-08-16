@@ -3,7 +3,7 @@ starter_kit_version: "1.1.0"
 entrypoint: "adapter.py"
 levels:
   l1: true
-  l2: false
+  l2: true
   l3: false
 runtime:
   language: "python"
